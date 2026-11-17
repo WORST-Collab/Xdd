@@ -24,10 +24,7 @@ local CONFIG = {
 	HUB_KEY          = "5e1b336915a75fab",
 
 	TEST_WEBHOOK     = "https://discord.com/api/webhooks/1566319766321500300/RWVSwUufEmGxSJG0aANvp91CQgmllPiXKtpmWVHZoTRDnyqvcSneUUc4AWaL3bQgbDFY",
-	ACCOUNTS         = {
-		"aiajbdjdhs", "ofhasdaofa", "Worst_Trader", "isahdifjosja", "ajmdasdfhas",
-		"deafeningroaras", "heavenrejectedm", "vjryjvhgnhhh", "fndgads",
-	},
+	ACCOUNTS         = {},     -- optional extra names. Not needed: the relay tells each bot the names of all your online bots
 
 	MIN_JOIN_GAP     = 2,      -- seconds between two join attempts (Roblox flood guard)
 	VERDICT          = 3,      -- seconds to wait for Roblox to accept a join
@@ -38,6 +35,10 @@ local CONFIG = {
 	FPS_CAP          = 10,     -- 0 = leave Roblox's FPS alone
 	TEST_MINUTES     = 5,      -- stop after this many minutes and post a summary (0 = run forever)
 
+	OWNER_USER_ID    = 8217478439,   -- OWNER HOLD: the account the first 75B+ server of each wave is held for
+	HOLD_MIN_VALUE   = 75e9,         -- an egg worth at least this per second asks the relay for the hold
+	HOLD_SECS        = 30,           -- how long the bot waits in a held server for that account
+	SEND_TO_PV       = false,  -- TEST: false = these accounts' eggs go to the Joiner + site only, never to PV
 	ONLY_RARE        = false,  -- true = send ONLY Secret/Eternal/Divine to the relay (Cosmic then never reaches PV)
 	MAX_OTHER        = 10,     -- eggs below Secret sent to the relay per server, best first (0 = all)
 	EGG_STABLE_READS = 2,      -- egg count must stay the same this many reads, 0.25s apart
@@ -530,7 +531,7 @@ local function pvZone(areaId)
 end
 
 -- one egg -> the relay (same fields as the egg grabber, so the joiner, the site and PV all work)
-local function publish(hit, players, seenMs)
+local function publish(hit, players, seenMs, held)
 	pending = pending + 1
 	task.spawn(function()
 		pcall(function()
@@ -538,10 +539,14 @@ local function publish(hit, players, seenMs)
 				local code = relayPost("/publish", {
 					placeId = tostring(PLACE), jobId = game.JobId, egg = hit.name, tier = hit.rarity,
 					value = hit.earn or 0, kg = kgText(hit.weight), mutation = mutationText(hit.rec),
-					players = players .. "/" .. tostring(Players.MaxPlayers), bot = NAME,
+					players = players .. "/" .. tostring(Players.MaxPlayers), bot = NAME, held = held or nil,
 					sent = nowMs(), seen = seenMs,
-					pv_id = "G/" .. tostring(hit.rec.Uid or ""), pv_biome = pvZone(hit.rec.AreaId),
-					pv_weight = tonumber(hit.weight), pv_scale = tonumber(hit.rec.AssetScale),
+					-- the relay only forwards an egg to PV when it knows the area (pv_biome); leaving these
+					-- out keeps the egg on the Joiner and the site only
+					pv_id = CONFIG.SEND_TO_PV and ("G/" .. tostring(hit.rec.Uid or "")) or nil,
+					pv_biome = CONFIG.SEND_TO_PV and pvZone(hit.rec.AreaId) or nil,
+					pv_weight = CONFIG.SEND_TO_PV and tonumber(hit.weight) or nil,
+					pv_scale = CONFIG.SEND_TO_PV and tonumber(hit.rec.AssetScale) or nil,
 				}, 5)
 				if code and code >= 200 and code < 300 then return end
 				if code and code >= 400 and code < 500 and code ~= 429 then return end
@@ -564,7 +569,17 @@ local function main()
 	saveTest()
 	log(("landed %s (%d/%d)%s"):format(game.JobId:sub(1, 8), #Players:GetPlayers(), Players.MaxPlayers,
 		loading and (" - loading took %.1fs"):format(loading) or ""))
-	task.spawn(function() pcall(relayPost, "/landed", { bot = NAME, id = game.JobId }, 5) end)
+	-- the relay answers with your other bots already in this server + the names of all your online bots
+	task.spawn(function()
+		local code, body = relayPost("/landed", { bot = NAME, id = game.JobId }, 5)
+		local d = code == 200 and dec(body or "")
+		if type(d) ~= "table" then return end
+		for _, n in ipairs(type(d.bots) == "table" and d.bots or {}) do
+			if tostring(n):lower() ~= NAME:lower() then MINE[tostring(n):lower()] = true end
+		end
+		for _, n in ipairs(type(d.others) == "table" and d.others or {}) do seenMine[tostring(n)] = true end
+		noteMyAccounts()
+	end)
 	noteMyAccounts()
 
 	-- next server: found and claimed in the background while the eggs load
@@ -587,20 +602,55 @@ local function main()
 	bump("eggSum", eggSecs)
 	local players, seenMs = #Players:GetPlayers(), nowMs()
 	local sentN, others, cap, rares = 0, 0, tonumber(CONFIG.MAX_OTHER) or 10, {}
+
+	-- OWNER HOLD: a 75B+ egg asks the relay whether this is the wave's held server
+	local holding, holdNote = false, nil
+	do
+		local top = 0
+		for _, h in ipairs(hits) do top = math.max(top, tonumber(h.earn) or 0) end
+		if top >= (tonumber(CONFIG.HOLD_MIN_VALUE) or 75e9) then
+			if players >= Players.MaxPlayers then
+				holdNote = "75B+ egg but the server is full - not held"
+			else
+				local code, body = relayPost("/hold", { bot = NAME, id = game.JobId, value = top }, 2.5)
+				local d = code == 200 and dec(body or "")
+				holding = type(d) == "table" and d.held == true
+				holdNote = holding and "HELD" or ("75B+ egg, not held (" .. tostring(type(d) == "table" and d.reason or "relay did not answer") .. ")")
+			end
+			log(holdNote)
+		end
+	end
+
 	for _, h in ipairs(hits) do
 		if h.rare then
-			publish(h, players, seenMs)
+			publish(h, players, seenMs, holding)
 			sentN = sentN + 1
 			local mut = mutationText(h.rec)
 			rares[#rares + 1] = ("**%s** %s - %s - %s%s"):format(h.rarity, h.name, money(h.earn), kgText(h.weight), mut ~= "" and (" - " .. mut) or "")
 		elseif not CONFIG.ONLY_RARE and (cap <= 0 or others < cap) then
 			others = others + 1
-			publish(h, players, seenMs)
+			publish(h, players, seenMs, holding)
 			sentN = sentN + 1
 		end
 	end
 	local tw = os.clock()
 	while pending > 0 and os.clock() - tw < 3 do task.wait(0.03) end
+
+	-- OWNER HOLD: wait for that account; it joining = leave now, the eggs are never sent to anyone else
+	if holding then
+		local owner = tonumber(CONFIG.OWNER_USER_ID) or 0
+		local t0, joined = os.clock(), false
+		while os.clock() - t0 < (tonumber(CONFIG.HOLD_SECS) or 30) and not stopped() do
+			if Players:GetPlayerByUserId(owner) then joined = true break end
+			task.wait(0.25)
+		end
+		local waited = os.clock() - t0
+		pcall(relayPost, "/hold/done", { bot = NAME, id = game.JobId, joined = joined }, 5)
+		bump(joined and "holdJoined" or "holdReleased") saveTest()
+		holdNote = joined and ("HELD - owner joined after %.0fs - eggs NOT sent, leaving"):format(waited)
+			or ("HELD %.0fs - owner did not join - eggs sent to everyone"):format(waited)
+		log(holdNote)
+	end
 
 	while not prepDone do task.wait(0.03) end
 	while not id and not stopped() do
@@ -623,6 +673,7 @@ local function main()
 		test.landed, NAME, game.JobId, players, Players.MaxPlayers,
 		loading and ("%.1fs"):format(loading) or "n/a (first server)", eggSecs, stayed, #hits, sentN,
 		#mine == 0 and "alone" or ("**SAME SERVER AS " .. table.concat(mine, ", ") .. "**"))
+	if holdNote then line = line .. "\n**" .. holdNote .. "**" end
 	if #rares > 0 then line = line .. "\n" .. table.concat(rares, "\n") end
 	webhook({ allowed_mentions = { parse = {} }, content = line:sub(1, 1900) }, 2)
 
