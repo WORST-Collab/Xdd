@@ -1,8 +1,7 @@
 --[[
-	FAST HOPPER (standalone)
-	land -> read the eggs -> send them to the relay -> hop. Each hop posts one line to the test
-	webhook: loading time, egg-data time, how long it stayed, the rare eggs, and whether any of your
-	other accounts was in that server. The next server is claimed WHILE the eggs load.
+	FAST HOPPER - HOP TEST (standalone)
+	No egg data. Each hop posts one line to the test webhook: how long the loading screen took,
+	how long the account stayed, and whether any of your other accounts was in that server.
 
 	FEWER 429s: the accounts on one PC share ONE server list (a file in the executor's workspace).
 	One account downloads a page, the others reuse it for SHARED_LIST_TTL seconds, and when Roblox
@@ -24,7 +23,10 @@ local CONFIG = {
 	HUB_KEY          = "5e1b336915a75fab",
 
 	TEST_WEBHOOK     = "https://discord.com/api/webhooks/1566319766321500300/RWVSwUufEmGxSJG0aANvp91CQgmllPiXKtpmWVHZoTRDnyqvcSneUUc4AWaL3bQgbDFY",
-	ACCOUNTS         = {},     -- optional extra names. Not needed: the relay tells each bot the names of all your online bots
+	ACCOUNTS         = {
+		"aiajbdjdhs", "ofhasdaofa", "Worst_Trader", "isahdifjosja", "ajmdasdfhas",
+		"deafeningroaras", "heavenrejectedm", "vjryjvhgnhhh", "fndgads",
+	},
 
 	MIN_JOIN_GAP     = 2,      -- seconds between two join attempts (Roblox flood guard)
 	VERDICT          = 3,      -- seconds to wait for Roblox to accept a join
@@ -34,18 +36,7 @@ local CONFIG = {
 	SHARED_LIST_TTL  = 20,     -- seconds the accounts reuse one downloaded page before fetching the next
 	FPS_CAP          = 10,     -- 0 = leave Roblox's FPS alone
 	TEST_MINUTES     = 5,      -- stop after this many minutes and post a summary (0 = run forever)
-
-	OWNER_USER_ID    = 8217478439,   -- OWNER HOLD: the account the first 75B+ server of each wave is held for
-	HOLD_MIN_VALUE   = 75e9,         -- an egg worth at least this per second asks the relay for the hold
-	HOLD_SECS        = 30,           -- how long the bot waits in a held server for that account
-	SEND_TO_PV       = false,  -- TEST: false = these accounts' eggs go to the Joiner + site only, never to PV
-	ONLY_RARE        = false,  -- true = send ONLY Secret/Eternal/Divine to the relay (Cosmic then never reaches PV)
-	MAX_OTHER        = 10,     -- eggs below Secret sent to the relay per server, best first (0 = all)
-	EGG_STABLE_READS = 2,      -- egg count must stay the same this many reads, 0.25s apart
-	EGG_EMPTY_WAIT   = 2,      -- seconds to wait when the egg list stays empty
-	EGG_MAX_WAIT     = 10,     -- most seconds to wait for egg data at all
 }
-local TARGET = { Secret = true, Eternal = true, Divine = true }
 
 do
 	local ok, g = pcall(getgenv)
@@ -111,7 +102,6 @@ local F_SLIST   = "fast-hopper-shared-list.txt"             -- { ts, data }
 local F_SCURSOR = "fast-hopper-shared-cursor.txt"
 local F_SBLOCK  = "fast-hopper-shared-block.txt"            -- Roblox said 429: nobody asks before this time
 local F_SFETCH  = "fast-hopper-shared-fetching.txt"         -- someone is downloading right now
-local F_SDEAD   = "fast-hopper-shared-dead.txt"             -- servers Roblox refused (closed / full): nobody tries them again
 
 local function readSet(file, maxAge)
 	local set, list, now = {}, {}, os.time()
@@ -241,15 +231,13 @@ end
 local function filterList(data)
 	local visited = readSet(F_VISITED, 3600)
 	local failed  = readSet(F_FAILED, 3600)
-	local dead    = readSet(F_SDEAD, 1800)
 	local good, laggy = {}, {}
 	for _, s in ipairs(data or {}) do
 		if type(s.id) == "string" and type(s.playing) == "number" and s.id ~= game.JobId
 			and s.playing < (s.maxPlayers or 7) and s.playing <= (tonumber(CONFIG.LIST_MAX_PLAYING) or 5)
-			and not visited[s.id] and not failed[s.id] and not dead[s.id] then
+			and not visited[s.id] and not failed[s.id] then
 			local p = tonumber(s.ping)
-			-- tried last: laggy servers, and servers listed with 0-1 players (most likely to have just closed)
-			if (p and p > (tonumber(CONFIG.LIST_PING_SKIP) or 110)) or s.playing < 2 then laggy[#laggy + 1] = s else good[#good + 1] = s end
+			if p and p > (tonumber(CONFIG.LIST_PING_SKIP) or 110) then laggy[#laggy + 1] = s else good[#good + 1] = s end
 		end
 	end
 	for _, t in ipairs({ good, laggy }) do
@@ -259,11 +247,10 @@ local function filterList(data)
 	return good
 end
 
--- the shared list if it is fresh, otherwise the next page. Falls back to a shared list at most 60s old
--- (older lists are full of closed servers: Roblox error 771). force = skip the fresh-list reuse.
-local function candidates(force)
+-- the shared list if it is fresh, otherwise the next page. Falls back to an older shared list.
+local function candidates()
 	local data, age = readShared()
-	if not force and data and age <= (tonumber(CONFIG.SHARED_LIST_TTL) or 20) then
+	if data and age <= (tonumber(CONFIG.SHARED_LIST_TTL) or 20) then
 		local c = filterList(data)
 		if #c > 0 then return c end
 	end
@@ -274,25 +261,20 @@ local function candidates(force)
 		fwrite(F_SCURSOR, "")                            -- nothing usable on that page (too deep / too full)
 		return {}
 	end
-	if data and age <= 60 then return filterList(data) end
+	if data and age <= 300 then return filterList(data) end
 	return {}
 end
 
--- the queue is rebuilt once it is older than SHARED_LIST_TTL, and right away after 3 refused joins in a row
-local queue, qi, queueAt, refusedStreak = {}, 0, 0, 0
+local queue, qi = {}, 0
 local function nextClaimed()
 	local refills = 0
 	while not stopped() do
 		qi = qi + 1
 		local s = queue[qi]
-		local stale = os.clock() - queueAt > (tonumber(CONFIG.SHARED_LIST_TTL) or 20)
-		if not s or stale or refusedStreak >= 3 then
+		if not s then
 			refills = refills + 1
-			if refills > 3 then return nil end
-			local force = refusedStreak >= 3
-			if force then log("3 refused joins in a row - getting a fresh server list") end
-			refusedStreak = 0
-			queue, qi, queueAt = candidates(force), 0, os.clock()
+			if refills > 2 then return nil end
+			queue, qi = candidates(), 0
 		elseif claim(s.id) then
 			return s.id
 		end
@@ -364,10 +346,8 @@ pcall(function()
 	TeleportService.TeleportInitFailed:Connect(function(p, result) if p == lp then verdict = "Failed " .. tostring(result) end end)
 end)
 
-local skipGap = false   -- the last join was refused (server gone): try the next one straight away
 local function tryJoin(id)
-	local gap = skipGap and 0 or (tonumber(CONFIG.MIN_JOIN_GAP) or 0)
-	skipGap = false
+	local gap = tonumber(CONFIG.MIN_JOIN_GAP) or 0
 	local since = os.time() - (tonumber(fread(F_JOIN) or "") or 0)
 	if gap > 0 and since >= 0 and since < gap then task.wait(gap - since) end
 
@@ -390,187 +370,12 @@ local function tryJoin(id)
 		task.wait(tonumber(CONFIG.LEAVE_WAIT) or 8)
 		log("accepted but never left " .. id:sub(1, 8))
 		bump("neverLeft")
-		addToSet(F_SDEAD, id, 300, 1800)
-		refusedStreak = refusedStreak + 1
 	else
 		log("refused " .. id:sub(1, 8) .. " (" .. tostring(verdict or "no answer") .. ")")
 		bump("refused")
-		addToSet(F_SDEAD, id, 300, 1800)                    -- tell the other accounts here: do not try this one
-		refusedStreak = refusedStreak + 1
-		skipGap = true
 	end
 	saveTest()
 	G.FAST_HOPPER_RUNNING = true
-end
-
--- ------------------------------------------------------------------ eggs
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local pending = 0   -- relay sends still on their way
-
-local function loadEggModules()
-	local ok, a, e = pcall(function()
-		local data   = ReplicatedStorage:WaitForChild("Data", 20)
-		local client = ReplicatedStorage:WaitForChild("Client", 20)
-		return require(data:WaitForChild("Assets", 20)), require(client:WaitForChild("EggState", 20))
-	end)
-	if ok and a and e then return a, e end
-	log("egg modules not ready: " .. tostring(a))
-	return nil, nil
-end
-
-local function liveRecords(eggState)
-	local ok, data = pcall(eggState.ReadFieldEggs)
-	if not ok or type(data) ~= "table" or type(data.Records) ~= "table" then return nil end
-	local out = {}
-	for key, rec in pairs(data.Records) do
-		if type(rec) == "table" then
-			local st = rec.State
-			if st == nil or tostring(st) == "Slot" or tostring(st) == "Dropped" then
-				local r = {}
-				for k, v in pairs(rec) do r[k] = v end
-				if r.Uid == nil then r.Uid = tostring(key) end
-				out[#out + 1] = r
-			end
-		end
-	end
-	return out
-end
-
--- the egg list arrives from Roblox in batches: wait until the count stops changing
-local function waitForEggs(eggState)
-	local t0 = os.clock()
-	local last, stable = nil, 0
-	while os.clock() - t0 < (tonumber(CONFIG.EGG_MAX_WAIT) or 10) do
-		local recs = liveRecords(eggState)
-		if recs then
-			if #recs > 0 then
-				if #recs == last then
-					stable = stable + 1
-					if stable >= (tonumber(CONFIG.EGG_STABLE_READS) or 2) then return true end
-				else
-					last, stable = #recs, 0
-				end
-			elseif os.clock() - t0 >= (tonumber(CONFIG.EGG_EMPTY_WAIT) or 2) then
-				return true
-			end
-		end
-		task.wait(0.25)
-	end
-	return false
-end
-
-local MUTATION_SCALAR = {
-	Silver = 1.2, Golden = 2.5, Rainbow = 3.5, Monstrous = 3, Boss = 2.75, Scrambled = 2.75, Enchanted = 2.85,
-	Sakura = 1.25, GreatBloom = 2.5, Nitro = 2.75, Spectral = 2.75, Parasite = 3, Fractured = 2.75,
-	Bloom = 1.25, SpiritBloom = 2.5,
-}
-local function scaleFactor(x)
-	if x <= 5 then return x ^ 1.85 end
-	return 5 ^ 1.85 * (x / 5) ^ 1.2
-end
-local function earning(cfg, rec)
-	local base = cfg and tonumber(cfg.EarningRate) or 0
-	if base <= 0 then return 0 end
-	local scale = tonumber(rec.AssetScale) or 0
-	if scale <= 0 then return base end
-	local m = 1
-	if type(rec.Mutations) == "table" then
-		for _, mid in ipairs(rec.Mutations) do
-			local x = MUTATION_SCALAR[tostring(mid)]
-			if x then m = m + math.max(0, x - 1) end
-		end
-	end
-	return math.max(math.round(base * scaleFactor(scale) * math.max(1, m)), 1)
-end
-local function rarityOf(cfg)
-	local r = cfg and cfg.Rarity
-	if type(r) == "table" then return r._id or r.id or r.Name end
-	return r
-end
-local function mutationText(rec)
-	if type(rec.Mutations) == "table" and #rec.Mutations > 0 then
-		local p = {}
-		for _, m in ipairs(rec.Mutations) do p[#p + 1] = tostring(m) end
-		return table.concat(p, ", ")
-	end
-	return ""
-end
-
-local function scan(assets, eggState)
-	local hits = {}
-	local dir = assets.Directory
-	for _, rec in ipairs(liveRecords(eggState) or {}) do
-		local cfg = dir and dir[rec.AssetCategory]
-		local rarity = rarityOf(cfg)
-		if rarity then
-			local w = cfg and tonumber(cfg.ModelWeight)
-			hits[#hits + 1] = {
-				rec = rec, rarity = tostring(rarity), rare = TARGET[tostring(rarity)] == true,
-				name = tostring((cfg and (cfg.DisplayName or cfg._id)) or rec.AssetCategory),
-				weight = w and w * math.max(tonumber(rec.AssetScale) or 0, 0) ^ 3 or nil,
-				earn = earning(cfg, rec),
-			}
-		end
-	end
-	table.sort(hits, function(a, b)
-		if a.rare ~= b.rare then return a.rare end
-		return (a.earn or 0) > (b.earn or 0)
-	end)
-	return hits
-end
-
-local SUFFIX = { "", "K", "M", "B", "T", "Qa", "Qi" }
-local function money(n)
-	n = tonumber(n) or 0
-	local i = 1
-	while n >= 1000 and i < #SUFFIX do n = n / 1000 i = i + 1 end
-	return ("$%.2f%s/s"):format(n, SUFFIX[i])
-end
-local function kgText(n)
-	if not n then return "?" end
-	local str = tostring(math.floor(n))
-	local out = str:sub(1, (#str - 1) % 3 + 1)
-	for j = (#str - 1) % 3 + 2, #str, 3 do out = out .. "," .. str:sub(j, j + 2) end
-	return out .. " Kg"
-end
-
-local PV_AREAS = {
-	cherryblossom = "Cherry Blossom", lightdark = "Light Dark", angelsdemons = "Light Dark",
-	titantemple = "Titan Temple", enchantedforest = "Enchanted Forest",
-	alien = "Alien", alienbiome = "Alien", alienworld = "Alien", alienlagoon = "Alien Lagoon",
-}
-local function pvZone(areaId)
-	local k = (tostring(areaId or ""):lower():gsub("[^%w]", ""))
-	if PV_AREAS[k] then return PV_AREAS[k] end
-	if k:find("alien", 1, true) then return "Alien" end
-	return nil
-end
-
--- one egg -> the relay (same fields as the egg grabber, so the joiner, the site and PV all work)
-local function publish(hit, players, seenMs, held)
-	pending = pending + 1
-	task.spawn(function()
-		pcall(function()
-			for attempt = 1, 2 do
-				local code = relayPost("/publish", {
-					placeId = tostring(PLACE), jobId = game.JobId, egg = hit.name, tier = hit.rarity,
-					value = hit.earn or 0, kg = kgText(hit.weight), mutation = mutationText(hit.rec),
-					players = players .. "/" .. tostring(Players.MaxPlayers), bot = NAME, held = held or nil,
-					sent = nowMs(), seen = seenMs,
-					-- the relay only forwards an egg to PV when it knows the area (pv_biome); leaving these
-					-- out keeps the egg on the Joiner and the site only
-					pv_id = CONFIG.SEND_TO_PV and ("G/" .. tostring(hit.rec.Uid or "")) or nil,
-					pv_biome = CONFIG.SEND_TO_PV and pvZone(hit.rec.AreaId) or nil,
-					pv_weight = CONFIG.SEND_TO_PV and tonumber(hit.weight) or nil,
-					pv_scale = CONFIG.SEND_TO_PV and tonumber(hit.rec.AssetScale) or nil,
-				}, 5)
-				if code and code >= 200 and code < 300 then return end
-				if code and code >= 400 and code < 500 and code ~= 429 then return end
-				if attempt == 1 then task.wait(0.5) end
-			end
-		end)
-		pending = pending - 1
-	end)
 end
 
 -- ------------------------------------------------------------------ main
@@ -585,90 +390,11 @@ local function main()
 	saveTest()
 	log(("landed %s (%d/%d)%s"):format(game.JobId:sub(1, 8), #Players:GetPlayers(), Players.MaxPlayers,
 		loading and (" - loading took %.1fs"):format(loading) or ""))
-	-- the relay answers with your other bots already in this server + the names of all your online bots
-	task.spawn(function()
-		local code, body = relayPost("/landed", { bot = NAME, id = game.JobId }, 5)
-		local d = code == 200 and dec(body or "")
-		if type(d) ~= "table" then return end
-		for _, n in ipairs(type(d.bots) == "table" and d.bots or {}) do
-			if tostring(n):lower() ~= NAME:lower() then MINE[tostring(n):lower()] = true end
-		end
-		for _, n in ipairs(type(d.others) == "table" and d.others or {}) do seenMine[tostring(n)] = true end
-		noteMyAccounts()
-	end)
+	task.spawn(function() pcall(relayPost, "/landed", { bot = NAME, id = game.JobId }, 5) end)
 	noteMyAccounts()
 
-	-- next server: found and claimed in the background while the eggs load
-	local id, prepDone = nil, false
-	task.spawn(function()
-		local ok, r = pcall(nextClaimed)
-		id = ok and r or nil
-		prepDone = true
-	end)
-
-	-- eggs -> relay
-	local eggT = os.clock()
-	local hits = {}
-	local assets, eggState = loadEggModules()
-	if assets then
-		waitForEggs(eggState)
-		hits = scan(assets, eggState)
-	end
-	local eggSecs = os.clock() - eggT
-	bump("eggSum", eggSecs)
-	local players, seenMs = #Players:GetPlayers(), nowMs()
-	local sentN, others, cap, rares = 0, 0, tonumber(CONFIG.MAX_OTHER) or 10, {}
-
-	-- OWNER HOLD: a 75B+ egg asks the relay whether this is the wave's held server
-	local holding, holdNote = false, nil
-	do
-		local top = 0
-		for _, h in ipairs(hits) do top = math.max(top, tonumber(h.earn) or 0) end
-		if top >= (tonumber(CONFIG.HOLD_MIN_VALUE) or 75e9) then
-			if players >= Players.MaxPlayers then
-				holdNote = "75B+ egg but the server is full - not held"
-			else
-				local code, body = relayPost("/hold", { bot = NAME, id = game.JobId, value = top }, 2.5)
-				local d = code == 200 and dec(body or "")
-				holding = type(d) == "table" and d.held == true
-				holdNote = holding and "HELD" or ("75B+ egg, not held (" .. tostring(type(d) == "table" and d.reason or "relay did not answer") .. ")")
-			end
-			log(holdNote)
-		end
-	end
-
-	for _, h in ipairs(hits) do
-		if h.rare then
-			publish(h, players, seenMs, holding)
-			sentN = sentN + 1
-			local mut = mutationText(h.rec)
-			rares[#rares + 1] = ("**%s** %s - %s - %s%s"):format(h.rarity, h.name, money(h.earn), kgText(h.weight), mut ~= "" and (" - " .. mut) or "")
-		elseif not CONFIG.ONLY_RARE and (cap <= 0 or others < cap) then
-			others = others + 1
-			publish(h, players, seenMs, holding)
-			sentN = sentN + 1
-		end
-	end
-	local tw = os.clock()
-	while pending > 0 and os.clock() - tw < 3 do task.wait(0.03) end
-
-	-- OWNER HOLD: wait for that account; it joining = leave now, the eggs are never sent to anyone else
-	if holding then
-		local owner = tonumber(CONFIG.OWNER_USER_ID) or 0
-		local t0, joined = os.clock(), false
-		while os.clock() - t0 < (tonumber(CONFIG.HOLD_SECS) or 30) and not stopped() do
-			if Players:GetPlayerByUserId(owner) then joined = true break end
-			task.wait(0.25)
-		end
-		local waited = os.clock() - t0
-		pcall(relayPost, "/hold/done", { bot = NAME, id = game.JobId, joined = joined }, 5)
-		bump(joined and "holdJoined" or "holdReleased") saveTest()
-		holdNote = joined and ("HELD - owner joined after %.0fs - eggs NOT sent, leaving"):format(waited)
-			or ("HELD %.0fs - owner did not join - eggs sent to everyone"):format(waited)
-		log(holdNote)
-	end
-
-	while not prepDone do task.wait(0.03) end
+	-- next server, claimed from the relay
+	local id = nextClaimed()
 	while not id and not stopped() do
 		bump("noServerWaits") saveTest()
 		log("no free server right now - retrying in 2s")
@@ -685,13 +411,10 @@ local function main()
 	for n in pairs(seenMine) do mine[#mine + 1] = n end
 	if #mine == 0 then bump("alone") else bump("shared") end
 	saveTest()
-	local line = ("**Hop %d** `%s` - `%s` - %d/%d players - loading %s - egg data %.1fs - stayed %.1fs - %d eggs (%d sent) - %s"):format(
-		test.landed, NAME, game.JobId, players, Players.MaxPlayers,
-		loading and ("%.1fs"):format(loading) or "n/a (first server)", eggSecs, stayed, #hits, sentN,
-		#mine == 0 and "alone" or ("**SAME SERVER AS " .. table.concat(mine, ", ") .. "**"))
-	if holdNote then line = line .. "\n**" .. holdNote .. "**" end
-	if #rares > 0 then line = line .. "\n" .. table.concat(rares, "\n") end
-	webhook({ allowed_mentions = { parse = {} }, content = line:sub(1, 1900) }, 2)
+	webhook({ allowed_mentions = { parse = {} }, content = ("**Hop %d** `%s` - `%s` - %d/%d players - loading %s - stayed %.1fs - %s"):format(
+		test.landed, NAME, game.JobId, #Players:GetPlayers(), Players.MaxPlayers,
+		loading and ("%.1fs"):format(loading) or "n/a (first server)", stayed,
+		#mine == 0 and "alone" or ("**SAME SERVER AS " .. table.concat(mine, ", ") .. "**")) }, 2)
 
 	-- test over: summary, stay here
 	if testOver() then
@@ -710,7 +433,6 @@ local function main()
 				f("Shared with my accounts", n("shared")),
 				f("Avg loading screen", ("%.1fs"):format((tonumber(test.loadingSum) or 0) / math.max(1, tonumber(test.loadingN) or 0))),
 				f("Avg stay", ("%.1fs"):format((tonumber(test.staySum) or 0) / landed)),
-				f("Avg egg data", ("%.1fs"):format((tonumber(test.eggSum) or 0) / landed)),
 				f("Joins refused", n("refused")),
 				f("Accepted but never left", n("neverLeft")),
 				f("Join errors", n("joinError")),
@@ -742,7 +464,7 @@ local function main()
 				tryJoin(id)
 				addToSet(F_FAILED, id, 60, 3600)
 				id = nil
-				task.wait(skipGap and 0.1 or 0.5)
+				task.wait(0.5)
 			end
 		end
 	end
