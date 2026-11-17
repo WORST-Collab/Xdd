@@ -135,14 +135,16 @@ addToSet(F_VISITED, game.JobId, 30, 3600)
 -- ------------------------------------------------------------------ timed test
 -- Safe with AutoExec and crashes: every start (after a hop, a crash or a rejoin) carries on with the
 -- SAME test. A new test starts only when the last one began more than TEST_MINUTES + 10 minutes ago,
--- or when the loader sets getgenv().FAST_HOPPER_NEWTEST = true first.
+-- or when the loader gives a test name that is DIFFERENT from the last one:
+--   getgenv().FAST_HOPPER_NEWTEST = "test2"
+-- (the same name again just carries on, so that line is safe to leave in AutoExec)
 local F_TEST = "fast-hopper-test-" .. UID .. ".txt"
 local TEST_MIN = tonumber(CONFIG.TEST_MINUTES) or 0
 local test = dec(fread(F_TEST) or "") or {}
-local forceNew = G.FAST_HOPPER_NEWTEST == true
+local testName = G.FAST_HOPPER_NEWTEST ~= nil and tostring(G.FAST_HOPPER_NEWTEST) or nil
 G.FAST_HOPPER_NEWTEST = nil
-if forceNew or not tonumber(test.start) or os.time() - test.start >= TEST_MIN * 60 + 600 then
-	test = { start = os.time(), landed = 0, counted = 0, shared = 0, done = false }
+if (testName and testName ~= test.name) or not tonumber(test.start) or os.time() - test.start >= TEST_MIN * 60 + 600 then
+	test = { name = testName or test.name, start = os.time(), landed = 0, counted = 0, shared = 0, done = false }
 end
 local function saveTest() fwrite(F_TEST, enc(test) or "") end
 local function bump(k, n) test[k] = (tonumber(test[k]) or 0) + (n or 1) end
