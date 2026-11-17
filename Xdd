@@ -21,7 +21,7 @@
 ]]
 
 local CONFIG = {
-	SCRIPT_URL       = "",                    -- raw link this file is hosted at (re-downloaded after every hop)
+	SCRIPT_URL       = "https://raw.githubusercontent.com/WORST-Collab/Xdd/refs/heads/main/Xdd",   -- raw link this file is hosted at (re-downloaded after every hop)
 	SELF_FILE        = "fast-hopper.lua",     -- used instead when SCRIPT_URL is "" (file in Delta's workspace)
 
 	HUB_URL          = "http://103.119.217.118:3000/publish",   -- your relay
