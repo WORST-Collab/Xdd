@@ -44,6 +44,8 @@ local CONFIG = {
 	LIST_MAX_PLAYING = 5,      -- only servers listed with at most this many players
 	LIST_PING_SKIP   = 110,    -- servers listed above this ping are tried last
 	FPS_CAP          = 10,     -- 0 = leave Roblox's FPS alone
+
+	TEST_MINUTES     = 5,      -- TEST: stop after this many minutes and post a summary (0 = run forever)
 }
 local TARGET = { Secret = true, Eternal = true, Divine = true }
 
@@ -77,8 +79,9 @@ local function fread(p) if type(readfile) ~= "function" then return nil end loca
 local function fwrite(p, d) if type(writefile) == "function" then pcall(writefile, p, d) end end
 local function nowMs() local ok, t = pcall(function() return DateTime.now().UnixTimestampMillis end) return ok and t or os.time() * 1000 end
 
+local finished = false   -- set when the TEST_MINUTES test is over
 local function stopped()
-	if G.FAST_HOPPER_STOP == true then return true end
+	if finished or G.FAST_HOPPER_STOP == true then return true end
 	local c = fread("fast-hopper-stop.txt")
 	return c ~= nil and c:match("^%s*1") ~= nil
 end
@@ -128,6 +131,25 @@ local function addToSet(file, id, keep, maxAge)
 	fwrite(file, table.concat(out, "\n"))
 end
 addToSet(F_VISITED, game.JobId, 30, 3600)
+
+-- ------------------------------------------------------------------ timed test
+-- Running the loader by hand starts a NEW test. The copy that reloads itself after a hop
+-- carries on with the same test, and stops for good once TEST_MINUTES have passed.
+local F_TEST = "fast-hopper-test-" .. UID .. ".txt"
+local TEST_MIN = tonumber(CONFIG.TEST_MINUTES) or 0
+local test = dec(fread(F_TEST) or "") or {}
+local cameFromHop = G.FAST_HOPPER_HOPPED == true
+G.FAST_HOPPER_HOPPED = nil
+if not cameFromHop or not tonumber(test.start) then
+	test = { start = os.time(), landed = 0, counted = 0, shared = 0, done = false }
+end
+local function saveTest() fwrite(F_TEST, enc(test) or "") end
+local function testOver() return TEST_MIN > 0 and os.time() - test.start >= TEST_MIN * 60 end
+if TEST_MIN > 0 and test.done then
+	G.FAST_HOPPER_RUNNING = false
+	print("[fast-hopper] the " .. TEST_MIN .. "-minute test is already over - run the loader again to start a new one")
+	return
+end
 
 -- ------------------------------------------------------------------ relay
 local RELAY = (tostring(CONFIG.HUB_URL):gsub("/publish/?$", ""))
@@ -432,7 +454,13 @@ local function postTest(hits, players, eggsOk)
 	if type(url) ~= "string" or url == "" or type(httpRequest) ~= "function" then return end
 	local others = myAccountsHere()
 	local n = tonumber(fread(F_COUNT) or "") or 0
-	if #others == 0 then n = n + 1 fwrite(F_COUNT, tostring(n)) end
+	if #others == 0 then
+		n = n + 1 fwrite(F_COUNT, tostring(n))
+		test.counted = (test.counted or 0) + 1
+	else
+		test.shared = (test.shared or 0) + 1
+	end
+	saveTest()
 
 	local lines = {}
 	lines[1] = ("**#%d** `%s` - `%s` - %d/%d players - %.1fs on this server"):format(
@@ -483,7 +511,7 @@ local function queueReload()
 local url, file = %q, %q
 local g = (getgenv and getgenv()) or _G
 if g.FAST_HOPPER_RUNNING then return end
-pcall(function() g.FAST_HOPPER_URL = url end)
+pcall(function() g.FAST_HOPPER_URL = url g.FAST_HOPPER_HOPPED = true end)
 local src
 if url ~= "" then
 	for _ = 1, 3 do
@@ -539,6 +567,8 @@ local function main()
 	while not game:IsLoaded() and os.clock() - t < 30 do task.wait(0.1) end
 	log(("landed %s (%d/%d)"):format(game.JobId:sub(1, 8), #Players:GetPlayers(), Players.MaxPlayers))
 	hbStatus = "Scanning"
+	test.landed = (test.landed or 0) + 1
+	saveTest()
 	task.spawn(function() pcall(relayPost, "/landed", { bot = NAME, id = game.JobId }, 5) end)
 
 	-- 1) find + claim the next server in the background, while the eggs load
@@ -569,6 +599,22 @@ local function main()
 	t = os.clock()
 	while pending > 0 and os.clock() - t < (tonumber(CONFIG.SEND_WAIT) or 3) do task.wait(0.03) end
 	log(("sent %d egg(s) in %.1fs"):format(#hits, os.clock() - T_START))
+
+	-- test over? post the summary and stop here instead of hopping
+	if testOver() then
+		test.done = true
+		saveTest()
+		local secs = os.time() - test.start
+		local body = enc({ allowed_mentions = { parse = {} }, content = ("**TEST DONE** `%s` - %d servers in %d:%02d - %d counted, %d shared with my accounts - about %.1fs per server"):format(
+			NAME, test.landed or 0, math.floor(secs / 60), secs % 60, test.counted or 0, test.shared or 0, secs / math.max(1, test.landed or 1)) })
+		if body and type(httpRequest) == "function" and CONFIG.TEST_WEBHOOK ~= "" then
+			pcall(httpRequest, { Url = CONFIG.TEST_WEBHOOK, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+		end
+		log("test over - staying in this server")
+		finished = true
+		hbStatus = "Test done"
+		return
+	end
 
 	-- 4) hop
 	hbStatus = "Hopping"
