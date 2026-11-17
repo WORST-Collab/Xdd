@@ -133,21 +133,22 @@ end
 addToSet(F_VISITED, game.JobId, 30, 3600)
 
 -- ------------------------------------------------------------------ timed test
--- Running the loader by hand starts a NEW test. The copy that reloads itself after a hop
--- carries on with the same test, and stops for good once TEST_MINUTES have passed.
+-- Safe with AutoExec and crashes: every start (after a hop, a crash or a rejoin) carries on with the
+-- SAME test. A new test starts only when the last one began more than TEST_MINUTES + 10 minutes ago,
+-- or when the loader sets getgenv().FAST_HOPPER_NEWTEST = true first.
 local F_TEST = "fast-hopper-test-" .. UID .. ".txt"
 local TEST_MIN = tonumber(CONFIG.TEST_MINUTES) or 0
 local test = dec(fread(F_TEST) or "") or {}
-local cameFromHop = G.FAST_HOPPER_HOPPED == true
-G.FAST_HOPPER_HOPPED = nil
-if not cameFromHop or not tonumber(test.start) then
+local forceNew = G.FAST_HOPPER_NEWTEST == true
+G.FAST_HOPPER_NEWTEST = nil
+if forceNew or not tonumber(test.start) or os.time() - test.start >= TEST_MIN * 60 + 600 then
 	test = { start = os.time(), landed = 0, counted = 0, shared = 0, done = false }
 end
 local function saveTest() fwrite(F_TEST, enc(test) or "") end
 local function testOver() return TEST_MIN > 0 and os.time() - test.start >= TEST_MIN * 60 end
 if TEST_MIN > 0 and test.done then
 	G.FAST_HOPPER_RUNNING = false
-	print("[fast-hopper] the " .. TEST_MIN .. "-minute test is already over - run the loader again to start a new one")
+	print("[fast-hopper] the " .. TEST_MIN .. "-minute test is over - a new one can start 10 minutes after it ended (or set getgenv().FAST_HOPPER_NEWTEST = true)")
 	return
 end
 
