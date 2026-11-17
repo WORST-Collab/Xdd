@@ -248,7 +248,8 @@ local function filterList(data)
 			and s.playing < (s.maxPlayers or 7) and s.playing <= (tonumber(CONFIG.LIST_MAX_PLAYING) or 5)
 			and not visited[s.id] and not failed[s.id] and not dead[s.id] then
 			local p = tonumber(s.ping)
-			if p and p > (tonumber(CONFIG.LIST_PING_SKIP) or 110) then laggy[#laggy + 1] = s else good[#good + 1] = s end
+			-- tried last: laggy servers, and servers listed with 0-1 players (most likely to have just closed)
+			if (p and p > (tonumber(CONFIG.LIST_PING_SKIP) or 110)) or s.playing < 2 then laggy[#laggy + 1] = s else good[#good + 1] = s end
 		end
 	end
 	for _, t in ipairs({ good, laggy }) do
@@ -363,8 +364,10 @@ pcall(function()
 	TeleportService.TeleportInitFailed:Connect(function(p, result) if p == lp then verdict = "Failed " .. tostring(result) end end)
 end)
 
+local skipGap = false   -- the last join was refused (server gone): try the next one straight away
 local function tryJoin(id)
-	local gap = tonumber(CONFIG.MIN_JOIN_GAP) or 0
+	local gap = skipGap and 0 or (tonumber(CONFIG.MIN_JOIN_GAP) or 0)
+	skipGap = false
 	local since = os.time() - (tonumber(fread(F_JOIN) or "") or 0)
 	if gap > 0 and since >= 0 and since < gap then task.wait(gap - since) end
 
@@ -394,6 +397,7 @@ local function tryJoin(id)
 		bump("refused")
 		addToSet(F_SDEAD, id, 300, 1800)                    -- tell the other accounts here: do not try this one
 		refusedStreak = refusedStreak + 1
+		skipGap = true
 	end
 	saveTest()
 	G.FAST_HOPPER_RUNNING = true
@@ -738,7 +742,7 @@ local function main()
 				tryJoin(id)
 				addToSet(F_FAILED, id, 60, 3600)
 				id = nil
-				task.wait(0.5)
+				task.wait(skipGap and 0.1 or 0.5)
 			end
 		end
 	end
