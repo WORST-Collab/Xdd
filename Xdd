@@ -145,6 +145,7 @@ if forceNew or not tonumber(test.start) or os.time() - test.start >= TEST_MIN * 
 	test = { start = os.time(), landed = 0, counted = 0, shared = 0, done = false }
 end
 local function saveTest() fwrite(F_TEST, enc(test) or "") end
+local function bump(k, n) test[k] = (tonumber(test[k]) or 0) + (n or 1) end
 local function testOver() return TEST_MIN > 0 and os.time() - test.start >= TEST_MIN * 60 end
 if TEST_MIN > 0 and test.done then
 	G.FAST_HOPPER_RUNNING = false
@@ -190,7 +191,12 @@ local relayMisses = 0
 local function claim(id)
 	local code, body = relayPost("/claim", { bot = NAME, id = id }, 2.5)
 	local d = code == 200 and dec(body or "")
-	if type(d) == "table" and type(d.granted) == "boolean" then relayMisses = 0 return d.granted end
+	if type(d) == "table" and type(d.granted) == "boolean" then
+		relayMisses = 0
+		if not d.granted then bump("denied") end
+		return d.granted
+	end
+	bump("relayMiss")
 	relayMisses = relayMisses + 1
 	log("relay did not answer the claim - not joining " .. id:sub(1, 8))
 	if relayMisses >= 3 then task.wait(3) end
@@ -216,6 +222,7 @@ local function fetchPage(fromStart)
 				return page.data
 			end
 		elseif code == 429 then
+			bump("list429")
 			local c = fread(F_LIST)
 			local ts, body = c and c:match("^(%d+)\r?\n(.*)$")
 			if ts and os.time() - tonumber(ts) <= 120 then
@@ -450,22 +457,16 @@ local function myAccountsHere()
 	return found
 end
 
-local function postTest(hits, players, eggsOk)
+local function postTest(hits, players, eggsOk, tLoad, tEggs)
 	local url = CONFIG.TEST_WEBHOOK
 	if type(url) ~= "string" or url == "" or type(httpRequest) ~= "function" then return end
 	local others = myAccountsHere()
-	local n = tonumber(fread(F_COUNT) or "") or 0
-	if #others == 0 then
-		n = n + 1 fwrite(F_COUNT, tostring(n))
-		test.counted = (test.counted or 0) + 1
-	else
-		test.shared = (test.shared or 0) + 1
-	end
+	if #others == 0 then bump("counted") else bump("shared") end
 	saveTest()
 
 	local lines = {}
-	lines[1] = ("**#%d** `%s` - `%s` - %d/%d players - %.1fs on this server"):format(
-		n, NAME, game.JobId, players, Players.MaxPlayers, os.clock() - T_START)
+	lines[1] = ("**Hop %d** (counted %d) `%s` - `%s` - %d/%d players - %.1fs here (loading %.1fs, egg data %.1fs)"):format(
+		test.landed or 0, test.counted or 0, NAME, game.JobId, players, Players.MaxPlayers, os.clock() - T_START, tLoad or 0, tEggs or 0)
 	if #others > 0 then
 		lines[#lines + 1] = "**SAME SERVER AS " .. table.concat(others, ", ") .. "** - not counted"
 	end
@@ -548,6 +549,7 @@ local function tryJoin(id)
 	if not ok then
 		G.FAST_HOPPER_RUNNING = true
 		log("join error " .. tostring(err))
+		bump("joinError") saveTest()
 		return
 	end
 	local t = os.clock()
@@ -556,8 +558,10 @@ local function tryJoin(id)
 		log("joining " .. id:sub(1, 8))
 		task.wait(tonumber(CONFIG.LEAVE_WAIT) or 8)
 		log("accepted but never left " .. id:sub(1, 8))
+		bump("neverLeft") saveTest()
 	else
 		log("refused " .. id:sub(1, 8) .. " (" .. tostring(verdict or "no answer") .. ")")
+		bump("refused") saveTest()
 	end
 	G.FAST_HOPPER_RUNNING = true
 end
@@ -566,6 +570,7 @@ end
 local function main()
 	local t = os.clock()
 	while not game:IsLoaded() and os.clock() - t < 30 do task.wait(0.1) end
+	local tLoad = os.clock() - T_START
 	log(("landed %s (%d/%d)"):format(game.JobId:sub(1, 8), #Players:GetPlayers(), Players.MaxPlayers))
 	hbStatus = "Scanning"
 	test.landed = (test.landed or 0) + 1
@@ -588,6 +593,7 @@ local function main()
 		hits = scan(assets, eggState)
 		eggsOk = true
 	end
+	local tEggs = os.clock() - T_START - tLoad
 	local players, seenMs = #Players:GetPlayers(), nowMs()
 
 	-- 3) send: every Secret/Eternal/Divine + the best MAX_OTHER of the rest, then the test webhook
@@ -596,18 +602,44 @@ local function main()
 		if h.rare then publish(h, players, seenMs)
 		elseif cap <= 0 or others < cap then others = others + 1 publish(h, players, seenMs) end
 	end
-	postTest(hits, players, eggsOk)
+	postTest(hits, players, eggsOk, tLoad, tEggs)
 	t = os.clock()
 	while pending > 0 and os.clock() - t < (tonumber(CONFIG.SEND_WAIT) or 3) do task.wait(0.03) end
 	log(("sent %d egg(s) in %.1fs"):format(#hits, os.clock() - T_START))
+	bump("onServer", os.clock() - T_START)
+	saveTest()
 
 	-- test over? post the summary and stop here instead of hopping
 	if testOver() then
 		test.done = true
 		saveTest()
 		local secs = os.time() - test.start
-		local body = enc({ allowed_mentions = { parse = {} }, content = ("**TEST DONE** `%s` - %d servers in %d:%02d - %d counted, %d shared with my accounts - about %.1fs per server"):format(
-			NAME, test.landed or 0, math.floor(secs / 60), secs % 60, test.counted or 0, test.shared or 0, secs / math.max(1, test.landed or 1)) })
+		local landed = math.max(1, tonumber(test.landed) or 1)
+		local onServer = tonumber(test.onServer) or 0
+		local between = math.max(0, secs - onServer)
+		local function n(k) return tostring(tonumber(test[k]) or 0) end
+		local function f(name, value) return { name = name, value = value, inline = true } end
+		local body = enc({ allowed_mentions = { parse = {} }, embeds = { {
+			title = "TEST DONE - " .. NAME,
+			color = (tonumber(test.shared) or 0) > 0 and 0xFFB020 or 0x37D67A,
+			description = ("**%d servers** in %d:%02d - about **%.1fs per server**"):format(landed, math.floor(secs / 60), secs % 60, secs / landed),
+			fields = {
+				f("Counted", n("counted")),
+				f("Shared with my accounts", n("shared")),
+				f("\u{200B}", "\u{200B}"),
+				f("Time on servers", ("%.1fs avg"):format(onServer / landed)),
+				f("Time between servers", ("%.1fs avg"):format(between / math.max(1, landed - 1))),
+				f("Waited for a free server", ("%.1fs total"):format(tonumber(test.waitServer) or 0)),
+				f("Joins refused", n("refused")),
+				f("Accepted but never left", n("neverLeft")),
+				f("Join errors", n("joinError")),
+				f("Server list 429s", n("list429")),
+				f("Relay said taken", n("denied")),
+				f("Relay no answer", n("relayMiss")),
+			},
+			footer = { text = "Time between servers = teleport + Roblox loading + any failed joins (crashes count here too)" },
+			timestamp = (function() local ok, t = pcall(function() return DateTime.now():ToIsoDate() end) return ok and t or nil end)(),
+		} } })
 		if body and type(httpRequest) == "function" and CONFIG.TEST_WEBHOOK ~= "" then
 			pcall(httpRequest, { Url = CONFIG.TEST_WEBHOOK, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
 		end
@@ -620,7 +652,10 @@ local function main()
 	-- 4) hop
 	hbStatus = "Hopping"
 	task.spawn(function() pcall(relayPost, "/beat", { name = NAME, status = "Hopping", eggs = 0 }, 5) end)
+	local tw = os.clock()
 	while not prepDone do task.wait(0.03) end
+	bump("waitServer", os.clock() - tw)
+	saveTest()
 	local id = nextId
 	while not stopped() do
 		if not game:IsLoaded() then              -- error screen: never teleport from here, wait for the rejoin
