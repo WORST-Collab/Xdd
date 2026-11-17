@@ -111,6 +111,7 @@ local F_SLIST   = "fast-hopper-shared-list.txt"             -- { ts, data }
 local F_SCURSOR = "fast-hopper-shared-cursor.txt"
 local F_SBLOCK  = "fast-hopper-shared-block.txt"            -- Roblox said 429: nobody asks before this time
 local F_SFETCH  = "fast-hopper-shared-fetching.txt"         -- someone is downloading right now
+local F_SDEAD   = "fast-hopper-shared-dead.txt"             -- servers Roblox refused (closed / full): nobody tries them again
 
 local function readSet(file, maxAge)
 	local set, list, now = {}, {}, os.time()
@@ -240,11 +241,12 @@ end
 local function filterList(data)
 	local visited = readSet(F_VISITED, 3600)
 	local failed  = readSet(F_FAILED, 3600)
+	local dead    = readSet(F_SDEAD, 1800)
 	local good, laggy = {}, {}
 	for _, s in ipairs(data or {}) do
 		if type(s.id) == "string" and type(s.playing) == "number" and s.id ~= game.JobId
 			and s.playing < (s.maxPlayers or 7) and s.playing <= (tonumber(CONFIG.LIST_MAX_PLAYING) or 5)
-			and not visited[s.id] and not failed[s.id] then
+			and not visited[s.id] and not failed[s.id] and not dead[s.id] then
 			local p = tonumber(s.ping)
 			if p and p > (tonumber(CONFIG.LIST_PING_SKIP) or 110) then laggy[#laggy + 1] = s else good[#good + 1] = s end
 		end
@@ -256,10 +258,11 @@ local function filterList(data)
 	return good
 end
 
--- the shared list if it is fresh, otherwise the next page. Falls back to an older shared list.
-local function candidates()
+-- the shared list if it is fresh, otherwise the next page. Falls back to a shared list at most 60s old
+-- (older lists are full of closed servers: Roblox error 771). force = skip the fresh-list reuse.
+local function candidates(force)
 	local data, age = readShared()
-	if data and age <= (tonumber(CONFIG.SHARED_LIST_TTL) or 20) then
+	if not force and data and age <= (tonumber(CONFIG.SHARED_LIST_TTL) or 20) then
 		local c = filterList(data)
 		if #c > 0 then return c end
 	end
@@ -270,20 +273,25 @@ local function candidates()
 		fwrite(F_SCURSOR, "")                            -- nothing usable on that page (too deep / too full)
 		return {}
 	end
-	if data and age <= 300 then return filterList(data) end
+	if data and age <= 60 then return filterList(data) end
 	return {}
 end
 
-local queue, qi = {}, 0
+-- the queue is rebuilt once it is older than SHARED_LIST_TTL, and right away after 3 refused joins in a row
+local queue, qi, queueAt, refusedStreak = {}, 0, 0, 0
 local function nextClaimed()
 	local refills = 0
 	while not stopped() do
 		qi = qi + 1
 		local s = queue[qi]
-		if not s then
+		local stale = os.clock() - queueAt > (tonumber(CONFIG.SHARED_LIST_TTL) or 20)
+		if not s or stale or refusedStreak >= 3 then
 			refills = refills + 1
-			if refills > 2 then return nil end
-			queue, qi = candidates(), 0
+			if refills > 3 then return nil end
+			local force = refusedStreak >= 3
+			if force then log("3 refused joins in a row - getting a fresh server list") end
+			refusedStreak = 0
+			queue, qi, queueAt = candidates(force), 0, os.clock()
 		elseif claim(s.id) then
 			return s.id
 		end
@@ -379,9 +387,13 @@ local function tryJoin(id)
 		task.wait(tonumber(CONFIG.LEAVE_WAIT) or 8)
 		log("accepted but never left " .. id:sub(1, 8))
 		bump("neverLeft")
+		addToSet(F_SDEAD, id, 300, 1800)
+		refusedStreak = refusedStreak + 1
 	else
 		log("refused " .. id:sub(1, 8) .. " (" .. tostring(verdict or "no answer") .. ")")
 		bump("refused")
+		addToSet(F_SDEAD, id, 300, 1800)                    -- tell the other accounts here: do not try this one
+		refusedStreak = refusedStreak + 1
 	end
 	saveTest()
 	G.FAST_HOPPER_RUNNING = true
