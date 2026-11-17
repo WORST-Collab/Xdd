@@ -2,6 +2,13 @@
 	FAST HOPPER (standalone) - owner hold, no time limit, no webhook, Joiner + site only
 	land -> read the eggs -> send them to the relay -> hop. The next server is claimed WHILE the eggs load.
 
+	RARE-EGG RULE (per account):
+	  - started and a Secret/Eternal/Divine egg is in the server -> hop for HUNT_SECS (260s = 4:20),
+	    then stay in whatever server it is in and wait for a NEW rare egg to spawn there
+	  - started and no rare egg -> stay in the server and wait for a rare egg to spawn
+	  - a rare egg spawning while it waits starts the next HUNT_SECS of hopping
+	  Rare eggs found while hopping do NOT extend the window. The owner hold works in every server.
+
 	FEWER 429s: the accounts on one PC share ONE server list (a file in the executor's workspace).
 	One account downloads a page, the others reuse it for SHARED_LIST_TTL seconds, and when Roblox
 	answers 429 every account backs off together instead of all asking again.
@@ -34,6 +41,8 @@ local CONFIG = {
 	SHARED_LIST_TTL  = 20,     -- seconds the accounts reuse one downloaded page before fetching the next
 	FPS_CAP          = 10,     -- 0 = leave Roblox's FPS alone
 	TEST_MINUTES     = 0,      -- 0 = run forever
+	HUNT_SECS        = 260,    -- after a rare egg is found: hop for this long (4:20), then stay and wait for the next one
+	WAIT_POLL        = 1,      -- seconds between egg checks while staying in a server
 
 	OWNER_USER_ID    = 8217478439,   -- OWNER HOLD: the account the first 75B+ server of each wave is held for
 	HOLD_MIN_VALUE   = 75e9,         -- an egg worth at least this per second asks the relay for the hold
@@ -92,6 +101,14 @@ do local t = os.clock() while not lp and os.clock() - t < 15 do task.wait(0.1) l
 if not lp then G.FAST_HOPPER_RUNNING = false warn("[fast-hopper] no LocalPlayer") return end
 local NAME, UID = lp.Name, tostring(lp.UserId)
 
+-- staying in one server for a long time: Roblox kicks idle players after 20 minutes, so keep the account active
+pcall(function()
+	local VirtualUser = game:GetService("VirtualUser")
+	lp.Idled:Connect(function()
+		pcall(function() VirtualUser:CaptureController() VirtualUser:ClickButton2(Vector2.new()) end)
+	end)
+end)
+
 local function log(msg)
 	local line = os.date("!%H:%M:%S") .. " " .. NAME .. "  " .. msg
 	print("[fast-hopper] " .. line)
@@ -106,6 +123,7 @@ local F_TP      = "fast-hopper-tp-" .. UID .. ".txt"        -- when the last tel
 local F_VISITED = "fast-hopper-visited-" .. UID .. ".txt"
 local F_FAILED  = "fast-hopper-failed-" .. UID .. ".txt"
 local F_TEST    = "fast-hopper-test-" .. UID .. ".txt"
+local F_HUNT    = "fast-hopper-hunt-" .. UID .. ".txt"      -- { huntEnd, alive }: when the current 4:20 hop window ends
 -- shared by every account in this workspace
 local F_SLIST   = "fast-hopper-shared-list.txt"             -- { ts, data }
 local F_SCURSOR = "fast-hopper-shared-cursor.txt"
@@ -130,6 +148,14 @@ local function addToSet(file, id, keep, maxAge)
 	fwrite(file, table.concat(out, "\n"))
 end
 addToSet(F_VISITED, game.JobId, 40, 3600)
+
+-- hunt window state. `alive` is refreshed all the time; if it is older than STALE_SECS the script was started by
+-- hand (or after a long stop), so the old window is forgotten and a rare egg in the first server starts a new one.
+local STALE_SECS = 180
+local hunt = dec(fread(F_HUNT) or "") or {}
+if os.time() - (tonumber(hunt.alive) or 0) > STALE_SECS then hunt = { huntEnd = 0 } end
+local function saveHunt() hunt.alive = os.time() fwrite(F_HUNT, enc(hunt) or "") end
+saveHunt()
 
 -- ------------------------------------------------------------------ timed test
 -- Every start (after a hop, a crash, AutoExec) carries on with the SAME test. A new test starts when
@@ -376,6 +402,7 @@ local function tryJoin(id)
 	queueReload()
 	fwrite(F_JOIN, tostring(os.time()))
 	fwrite(F_TP, tostring(nowMs()))
+	saveHunt()
 	local ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(PLACE, id, lp) end)
 	if not ok then
 		G.FAST_HOPPER_RUNNING = true
@@ -573,50 +600,8 @@ local function publish(hit, players, seenMs, held)
 	end)
 end
 
--- ------------------------------------------------------------------ main
-local function main()
-	while not game:IsLoaded() do task.wait(0.05) end
-	local loadedMs, loadedAt = nowMs(), os.clock()
-	local tpMs = tonumber(fread(F_TP) or "")
-	local loading = (tpMs and loadedMs - tpMs > 0 and loadedMs - tpMs < 180000) and (loadedMs - tpMs) / 1000 or nil
-	fwrite(F_TP, "")
-	bump("landed")
-	if loading then bump("loadingSum", loading) bump("loadingN") end
-	saveTest()
-	log(("landed %s (%d/%d)%s"):format(game.JobId:sub(1, 8), #Players:GetPlayers(), Players.MaxPlayers,
-		loading and (" - loading took %.1fs"):format(loading) or ""))
-	-- the relay answers with your other bots already in this server + the names of all your online bots
-	task.spawn(function()
-		local code, body = relayPost("/landed", { bot = NAME, id = game.JobId }, 5)
-		local d = code == 200 and dec(body or "")
-		if type(d) ~= "table" then return end
-		for _, n in ipairs(type(d.bots) == "table" and d.bots or {}) do
-			if tostring(n):lower() ~= NAME:lower() then MINE[tostring(n):lower()] = true end
-		end
-		for _, n in ipairs(type(d.others) == "table" and d.others or {}) do seenMine[tostring(n)] = true end
-		noteMyAccounts()
-	end)
-	noteMyAccounts()
-
-	-- next server: found and claimed in the background while the eggs load
-	local id, prepDone = nil, false
-	task.spawn(function()
-		local ok, r = pcall(nextClaimed)
-		id = ok and r or nil
-		prepDone = true
-	end)
-
-	-- eggs -> relay
-	local eggT = os.clock()
-	local hits = {}
-	local assets, eggState = loadEggModules()
-	if assets then
-		waitForEggs(eggState)
-		hits = scan(assets, eggState)
-	end
-	local eggSecs = os.clock() - eggT
-	bump("eggSum", eggSecs)
-	local players, seenMs = #Players:GetPlayers(), nowMs()
+-- ------------------------------------------------------------------ one landing: eggs -> relay -> owner hold
+local function handleEggs(hits, players, seenMs)
 	local sentN, others, cap, rares = 0, 0, tonumber(CONFIG.MAX_OTHER) or 10, {}
 
 	-- OWNER HOLD: a 75B+ egg asks the relay whether this is the wave's held server
@@ -667,82 +652,195 @@ local function main()
 			or ("HELD %.0fs - owner did not join - eggs sent to everyone"):format(waited)
 		log(holdNote)
 	end
+	return sentN, rares, holdNote
+end
 
-	while not prepDone do task.wait(0.03) end
-	while not id and not stopped() do
-		bump("noServerWaits") saveTest()
-		log("no free server right now - retrying in 2s")
-		task.wait(2)
-		noteMyAccounts()
-		id = nextClaimed()
+-- ------------------------------------------------------------------ rare-egg rule
+local function hasRare(hits)
+	for _, h in ipairs(hits) do if h.rare then return true end end
+	return false
+end
+local function rareUids(hits)
+	local set = {}
+	for _, h in ipairs(hits) do if h.rare then set[tostring(h.rec.Uid)] = true end end
+	return set
+end
+-- stay in this server until a rare egg that is not in `known` shows up. true = one did, false = stopped.
+local function waitForNewRare(assets, eggState, known)
+	log("staying in this server - waiting for a new rare egg")
+	local lastAlive = 0
+	while not stopped() do
+		if os.time() - lastAlive >= 5 then saveHunt() lastAlive = os.time() end
+		for _, h in ipairs(scan(assets, eggState)) do
+			if h.rare and not known[tostring(h.rec.Uid)] then return true end
+		end
+		task.wait(tonumber(CONFIG.WAIT_POLL) or 1)
 	end
+	return false
+end
+
+-- ------------------------------------------------------------------ main
+local function main()
+	while not game:IsLoaded() do task.wait(0.05) end
+	local loadedMs, loadedAt = nowMs(), os.clock()
+	local tpMs = tonumber(fread(F_TP) or "")
+	local loading = (tpMs and loadedMs - tpMs > 0 and loadedMs - tpMs < 180000) and (loadedMs - tpMs) / 1000 or nil
+	fwrite(F_TP, "")
+	bump("landed")
+	if loading then bump("loadingSum", loading) bump("loadingN") end
+	saveTest()
+	log(("landed %s (%d/%d)%s"):format(game.JobId:sub(1, 8), #Players:GetPlayers(), Players.MaxPlayers,
+		loading and (" - loading took %.1fs"):format(loading) or ""))
+	-- the relay answers with your other bots already in this server + the names of all your online bots
+	task.spawn(function()
+		local code, body = relayPost("/landed", { bot = NAME, id = game.JobId }, 5)
+		local d = code == 200 and dec(body or "")
+		if type(d) ~= "table" then return end
+		for _, n in ipairs(type(d.bots) == "table" and d.bots or {}) do
+			if tostring(n):lower() ~= NAME:lower() then MINE[tostring(n):lower()] = true end
+		end
+		for _, n in ipairs(type(d.others) == "table" and d.others or {}) do seenMine[tostring(n)] = true end
+		noteMyAccounts()
+	end)
 	noteMyAccounts()
 
-	-- the proof-of-hop line
-	local stayed = os.clock() - loadedAt
-	bump("staySum", stayed)
-	local mine = {}
-	for n in pairs(seenMine) do mine[#mine + 1] = n end
-	if #mine == 0 then bump("alone") else bump("shared") end
-	saveTest()
-	local line = ("**Hop %d** `%s` - `%s` - %d/%d players - loading %s - egg data %.1fs - stayed %.1fs - %d eggs (%d sent) - %s"):format(
-		test.landed, NAME, game.JobId, players, Players.MaxPlayers,
-		loading and ("%.1fs"):format(loading) or "n/a (first server)", eggSecs, stayed, #hits, sentN,
-		#mine == 0 and "alone" or ("**SAME SERVER AS " .. table.concat(mine, ", ") .. "**"))
-	if holdNote then line = line .. "\n**" .. holdNote .. "**" end
-	if #rares > 0 then line = line .. "\n" .. table.concat(rares, "\n") end
-	webhook({ allowed_mentions = { parse = {} }, content = line:sub(1, 1900) }, 2)
+	local huntLen = tonumber(CONFIG.HUNT_SECS) or 260
+	local function huntLeft() return (tonumber(hunt.huntEnd) or 0) - os.time() end
 
-	-- test over: summary, stay here
-	if testOver() then
-		test.done = true
+	-- next server: claimed in the background while the eggs load - but only while this account is hopping,
+	-- so an account that is waiting never reserves servers it will not join
+	local id, prepDone, prepStarted = nil, false, false
+	local function startPrep()
+		if prepStarted then return end
+		prepStarted = true
+		task.spawn(function()
+			local ok, r = pcall(nextClaimed)
+			id = ok and r or nil
+			prepDone = true
+		end)
+	end
+	local function startHunt(why)
+		hunt.huntEnd = os.time() + huntLen
+		saveHunt()
+		log(("%s - hopping for the next %ds"):format(why, huntLen))
+		-- drop any old claimed server from an earlier window, claim a fresh one
+		if prepDone then id, prepDone, prepStarted = nil, false, false end
+		startPrep()
+	end
+	if huntLeft() > 0 then startPrep() end
+
+	-- eggs
+	local eggT = os.clock()
+	local hits = {}
+	local assets, eggState = loadEggModules()
+	if assets then
+		waitForEggs(eggState)
+		hits = scan(assets, eggState)
+	end
+	local eggSecs = os.clock() - eggT
+	bump("eggSum", eggSecs)
+	local players, seenMs = #Players:GetPlayers(), nowMs()
+
+	-- RULE: the script was just started and a rare egg is here -> start the hunt window.
+	-- (If a window already ran, the rare eggs in this server are old news: only a NEW one starts the next window.)
+	local hadHunt = (tonumber(hunt.huntEnd) or 0) > 0
+	if huntLeft() <= 0 and assets and not hadHunt and hasRare(hits) then startHunt("rare egg found") end
+
+	local sentN, rares, holdNote = handleEggs(hits, players, seenMs)
+	local known = rareUids(hits)
+	local mustHop = (assets == nil)   -- cannot read eggs here: keep hopping like before
+	local reported = false
+
+	-- the proof-of-hop line + test summary (once per server, just before leaving it). true = test over
+	local function report()
+		local stayed = os.clock() - loadedAt
+		bump("staySum", stayed)
+		noteMyAccounts()
+		local mine = {}
+		for n in pairs(seenMine) do mine[#mine + 1] = n end
+		if #mine == 0 then bump("alone") else bump("shared") end
 		saveTest()
-		local secs = os.time() - test.start
-		local landed = math.max(1, tonumber(test.landed) or 1)
-		local function n(k) return tostring(tonumber(test[k]) or 0) end
-		local function f(name, value) return { name = name, value = value, inline = true } end
-		webhook({ allowed_mentions = { parse = {} }, embeds = { {
-			title = "TEST DONE - " .. NAME,
-			color = (tonumber(test.shared) or 0) > 0 and 0xFFB020 or 0x37D67A,
-			description = ("**%d servers** in %d:%02d - about **%.1fs per server**"):format(landed, math.floor(secs / 60), secs % 60, secs / landed),
-			fields = {
-				f("Alone", n("alone")),
-				f("Shared with my accounts", n("shared")),
-				f("Avg loading screen", ("%.1fs"):format((tonumber(test.loadingSum) or 0) / math.max(1, tonumber(test.loadingN) or 0))),
-				f("Avg stay", ("%.1fs"):format((tonumber(test.staySum) or 0) / landed)),
-				f("Avg egg data", ("%.1fs"):format((tonumber(test.eggSum) or 0) / landed)),
-				f("Joins refused", n("refused")),
-				f("Accepted but never left", n("neverLeft")),
-				f("Join errors", n("joinError")),
-				f("Server list downloads", n("listFetch")),
-				f("Server list 429s", n("list429")),
-				f("Waited for a free server", n("noServerWaits") .. " x 2s"),
-				f("Relay said taken", n("denied")),
-				f("Relay no answer", n("relayMiss")),
-			},
-			footer = { text = "Loading = from the teleport starting to the next server being loaded" },
-		} } }, 5)
-		log("test over - staying in this server")
-		finished = true
-		return
+		local line = ("**Hop %d** `%s` - `%s` - %d/%d players - loading %s - egg data %.1fs - stayed %.1fs - %d eggs (%d sent) - %s"):format(
+			test.landed, NAME, game.JobId, players, Players.MaxPlayers,
+			loading and ("%.1fs"):format(loading) or "n/a (first server)", eggSecs, stayed, #hits, sentN,
+			#mine == 0 and "alone" or ("**SAME SERVER AS " .. table.concat(mine, ", ") .. "**"))
+		if holdNote then line = line .. "\n**" .. holdNote .. "**" end
+		if #rares > 0 then line = line .. "\n" .. table.concat(rares, "\n") end
+		webhook({ allowed_mentions = { parse = {} }, content = line:sub(1, 1900) }, 2)
+
+		if testOver() then
+			test.done = true
+			saveTest()
+			local secs = os.time() - test.start
+			local landed = math.max(1, tonumber(test.landed) or 1)
+			local function n(k) return tostring(tonumber(test[k]) or 0) end
+			local function f(name, value) return { name = name, value = value, inline = true } end
+			webhook({ allowed_mentions = { parse = {} }, embeds = { {
+				title = "TEST DONE - " .. NAME,
+				color = (tonumber(test.shared) or 0) > 0 and 0xFFB020 or 0x37D67A,
+				description = ("**%d servers** in %d:%02d - about **%.1fs per server**"):format(landed, math.floor(secs / 60), secs % 60, secs / landed),
+				fields = {
+					f("Alone", n("alone")),
+					f("Shared with my accounts", n("shared")),
+					f("Avg loading screen", ("%.1fs"):format((tonumber(test.loadingSum) or 0) / math.max(1, tonumber(test.loadingN) or 0))),
+					f("Avg stay", ("%.1fs"):format((tonumber(test.staySum) or 0) / landed)),
+					f("Avg egg data", ("%.1fs"):format((tonumber(test.eggSum) or 0) / landed)),
+					f("Joins refused", n("refused")),
+					f("Accepted but never left", n("neverLeft")),
+					f("Join errors", n("joinError")),
+					f("Server list downloads", n("listFetch")),
+					f("Server list 429s", n("list429")),
+					f("Waited for a free server", n("noServerWaits") .. " x 2s"),
+					f("Relay said taken", n("denied")),
+					f("Relay no answer", n("relayMiss")),
+				},
+				footer = { text = "Loading = from the teleport starting to the next server being loaded" },
+			} } }, 5)
+			log("test over - staying in this server")
+			finished = true
+			return true
+		end
+		return false
 	end
 
-	-- hop
+	-- hop while the hunt window is open, otherwise stay here and wait for a new rare egg
 	while not stopped() do
-		if not game:IsLoaded() then
-			log("not in a game - waiting")
-			task.wait(3)
+		if not (mustHop or huntLeft() > 0) then
+			if waitForNewRare(assets, eggState, known) then
+				waitForEggs(eggState)                       -- let the rest of the new eggs arrive
+				hits = scan(assets, eggState)
+				startHunt("new rare egg spawned")
+				players, seenMs = #Players:GetPlayers(), nowMs()
+				sentN, rares, holdNote = handleEggs(hits, players, seenMs)
+				known = rareUids(hits)
+			end
 		else
-			if not id then id = nextClaimed() end
-			if not id then
-				bump("noServerWaits") saveTest()
-				log("no free server right now - retrying in 2s")
-				task.wait(2)
+			startPrep()
+			while not prepDone do task.wait(0.03) end
+			if not mustHop and huntLeft() <= 0 then
+				-- the window ended while the next server was being claimed: do NOT join it, stay here
+				log("hunt window over - staying in this server")
+				id, prepDone, prepStarted = nil, false, false
+			elseif not game:IsLoaded() then
+				log("not in a game - waiting")
+				task.wait(3)
 			else
-				tryJoin(id)
-				addToSet(F_FAILED, id, 60, 3600)
-				id = nil
-				task.wait(skipGap and 0.1 or 0.5)
+				if not id then id = nextClaimed() end
+				if not id then
+					bump("noServerWaits") saveTest()
+					log("no free server right now - retrying in 2s")
+					task.wait(2)
+					noteMyAccounts()
+				else
+					if not reported then
+						reported = true
+						if report() then return end
+					end
+					tryJoin(id)
+					addToSet(F_FAILED, id, 60, 3600)
+					id = nil
+					task.wait(skipGap and 0.1 or 0.5)
+				end
 			end
 		end
 	end
